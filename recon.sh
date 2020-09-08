@@ -1,150 +1,176 @@
 #!/bin/bash
 
-#TOOLS NEEDED FOR THE SCAN..
-#sublist3r,assetfinder, amass, shuffledns, https, nuclei, waybackurls, ffuf, gf, massdns, unfurl 
+###############################################################################
+# recon.sh
+#
+# Web application recon script
+#
+# Version 0.1 (Feb 11, 2020)
+# Matt Adams
+#
+###############################################################################
 
 
-#........PATHS TO WORDLIST AND RESOLVER IPS..............
-host=$1
-wordlist="/root/scripts/86a06c5dc309d08580a018c66354a056/all.txt"
-resolvers="/root/scripts/resolverips.txt"
-resolve_domain="/path to massdns -r /root/50resolvers.txt -t A -o 5 -w"
+dirsearchThreads=50
+dirsearchWordlist=~/tools/dirsearch/db/dicc.txt
+massdnsWordlist=~/tools/SecLists/Discovery/DNS/clean-jhaddix-dns.txt
+chromiumPath=/usr/bin/chromium
 
+domain=
+usage() { echo -e "Usage: ./recon.sh -d domain.com" 1>&2; exit 1; }
 
-domain_enum(){
-
-for domain in $(cat $host);
-do
-
-mkdir -p $domain/sources $domain/Recon $domain/Recon/nuclei $domain/Recon/wayback $domain/Recon/gf $domain/Recon/wordlist $domain/Recon/masscan
-
-#......PASSIVE ENUMERATOR...........
-
-subfinder -d $domain -o $domain/sources/subfinder.txt
-assetfinder -subs-only $domain | tee $domain/sources/assefinder.txt
-amass enum -passive -d $domain -o $domain/sources/amass.txt
-
-#.........ACTIVE ENUMERATION - BRUTEFORCE using resolver ips an part of (domain_enum)...........
-
-shuffledns -d $domain -w $wordlist -r $resolvers -o $domain/sources/shuffledns.txt
-
-cat $domain/sources/*.txt > $domain/sources/all.txt
-
+while getopts ":d:" o; do
+	case "${o}" in
+		d)
+			domain=${OPTARG}
+			;;
+	esac
 done
+shift $((OPTIND - 1))
+
+if [ -z "${domain}" ]; then
+	usage; exit 1;
+fi
+
+#### Helpers 
+
+createOutputDir() {
+
+	if [ -d "$reportBase" ]
+	then
+		echo "This is a known target."
+	else
+		mkdir -p $reportBase
+	fi
+
+	mkdir $reportPath
 }
-domain_enum
 
-#..........RESOLVER FOR DNS SERVERS,,,,,,,,,,
+#### // Helpers
+
+subdiscovery() {
+
+  echo ""
+  echo "******************** Subdomain Discovery ********************"
+
+  echo ""
+  echo "[+] Getting subdomains with sublister (sublist3r_out.txt)"
+  echo ""
+  python ~/tools/Sublist3r/sublist3r.py -d $domain -t 10 -o $reportPath/sublist3r_out.txt 2>/dev/null
+
+  echo ""
+  echo "[+] Checking certspotter (certspotter_out.txt)"
+  echo ""
+  curl -s https://certspotter.com/api/v0/certs\?domain\=$domain | jq '.[].dns_names[]' | sed 's/\"//g' | sed 's/\*\.//g' | sort -u | grep $domain | tee $reportPath/certspotter_out.txt
+
+  echo ""
+  echo "[+] Checking http://crt.sh (crt.sh_out.txt)"
+  echo ""
+  ~/tools/massdns/scripts/ct.py $domain 2>/dev/null | tee $reportPath/crt.sh_out.txt
+
+  echo ""
+  echo "[+] Creating subdomain bruteforce list with subbrute.py (subbrute_list.txt)"
+  ~/tools/massdns/scripts/subbrute.py $massdnsWordlist $domain > $reportPath/subbrute_list.txt
 
 
-resolving_domains(){
+  echo ""
+  echo "[+] Resolving subdomains (sublist3r_resolved.txt, crt.sh_out.txt, subbrute_resolved.txt)"
+  echo "This would be a good time for a coffee. This is going to take a minute"
+  echo ""
+  [ -s $reportPath/sublist3r_out.txt ] && cat $reportPath/sublist3r_out.txt | ~/tools/massdns/bin/massdns -r ~/tools/massdns/lists/resolvers.txt -t A -q -o S -w $reportPath/sublist3r_resolved.txt
 
-	for domain in $(cat $host);
-do
-shuffledns -d $domain -list $domain/sources/all.txt -o $domain/domain.txt -r $resolvers
+  [ -s $reportPath/crt.sh_out.txt ] && cat $reportPath/crt.sh_out.txt | ~/tools/massdns/bin/massdns -r ~/tools/massdns/lists/resolvers.txt -t A -q -o S -w  $reportPath/crt.sh_resolved.txt
 
-done
+  [ -s $reportPath/subbrute_list.txt ] && cat $reportPath/subbrute_list.txt | ~/tools/massdns/bin/massdns -r ~/tools/massdns/lists/resolvers.txt -t A -q -o S | grep -v 142.54.173.92 > $reportPath/subbrute_resolved.txt
+
+  # Put all resolved subdomains in one file
+  [ -s $reportPath/sublist3r_resolved.txt ] && cat $reportPath/sublist3r_resolved.txt > $reportPath/resolved_domains_raw.txt
+  [ -s $reportPath/crt.sh_resolved.txt ] && cat $reportPath/crt.sh_resolved.txt >> $reportPath/resolved_domains_raw.txt
+  [ -s $reportPath/subbrute_resolved.txt ] && cat $reportPath/subbrute_resolved.txt >> $reportPath/resolved_domains_raw.txt
 }
-resolving_domains
 
+livehosts() {
 
-#...............LOOKING FOR LIVE HTTP/HTTPS DOMAINS...........
+  echo ""
+  echo "******************** Live Host Discovery ********************"
+  echo ""
 
-http_probe(){
+  echo "[+] Parsing unique urls (url_list.txt)"
+  cat $reportPath/resolved_domains_raw.txt| awk '{print $3}' | sort -u | while read line; do
+    wildcard=$(cat $reportPath/resolved_domains_raw.txt| grep -m 1 $line)
+    echo "$wildcard" >> $reportPath/url_temp.txt
+  done
 
-	for domain in $(cat $host);
-do
-cat $domain/domains.txt | httpx -threads 300 -o $domain/Recon/httpx.txt
+  cat $reportPath/url_temp.txt | awk '{print $1}' | while read line; do
+    x="$line"
+    echo "${x%?}" >> $reportPath/url_list.txt
+  done
+  cat $reportPath/sublist3r_out.txt >> $reportPath/url_list.txt
+  cat $reportPath/certspotter_out.txt >> $reportPath/url_list.txt
 
-done
+  echo ""
+  echo "[+] Searching for live hosts (url_live.txt)"
+  echo ""
+  cat $reportPath/url_list.txt | sort -u | httprobe | tee $reportPath/url_live.txt
+
+  echo ""
+  echo "[+] Capturing screenshots of live domains (aquatone_out/)"
+  cat $reportPath/url_live.txt | aquatone --chrome-path /snap/bin/chromium --out $reportPath/aquatone_out
 }
-http_probe
 
 
-#..........SCANING URLS INTO nuclei......
+cleanup() {
+  echo ""
+  echo "******************** Cleanup ********************"
+  echo ""
 
-scanner(){
-
-for domain in $(cat $host);
-do
-
-cat $domain/Recon/httpx.txt | nuclei -t ~/nuclei-templates/cves/ -c 50 -o $domain/Recon/nuclei/cves.txt
-cat $domain/Recon/httpx.txt | nuclei -t ~/nuclei-templates/vulnerabilities/ -c 50 -o $domain/Recon/nuclei/cves.txt
-cat $domain/Recon/httpx.txt | nuclei -t ~/nuclei-templates/files/ -c 50 -o $domain/Recon/nuclei/cves.txt
-
-done
-
+  echo "[+] Performing cleanup"
+  rm -rf $reportPath/certspotter_out.txt
+  rm -rf $reportPath/crt.sh_out.txt
+  rm -rf $reportPath/sublist3r_out.txt
+  rm -rf $reportPath/url_temp.txt
 }
-scanner
-
-#......Fetch waybackurls....
-
-wayback_data(){
 
 
-for domain in $(cat $host);
-do
-cat $domain/domains.txt | waybackurls | tee $domain/Recon/wayback/tmp.txt
-cat $domain/Recon/wayback/tmp.txt | egrep -v "|\.png|\.jpeg|\.jpg|\.svg|\.css|\.ico|\.woff|\.ttf|\.eot|" | sed 's/:80//g;s/:443//g' | sort -u >. $domain/Recon/wayback/wayback.txt
-rm $domain/Recon/wayback/tmp.txt
+archive() {
 
-done
+  echo ""
+  echo "******************** Archiving Results ********************"
+  echo ""
+
+  echo "[+] Creating tar archive ($reportBase/$today.tar.gz)"
+  tar -czf "$reportBase/$today.tar.gz" $reportPath
 }
-wayback_data
-
-#.............filltering "vaild urls" from wayback data to ffuf
 
 
-vaild_urls(){
+main() {
 
-for domain in $(cat $host);
-do
-fuzzer -c -u "FUZZ" -W $domain/Recon/wayback/wayback.txt -of csv -o $domain/Recon/wayback/vaild-tmp.txt
-cat $domain/Recon/wayback/vaild-tmp.txt| grep http | awk -F "," '{print $1}' >> $domain/Recon/wayback/vaild.txt
-rm $domain/Recon/wayback/vaild-tmp.txt
+	clear
+	echo "Starting recon on $domain"
 
-done
+	createOutputDir
+
+  subdiscovery
+  livehosts  
+  cleanup
+  archive
+
+  # TODO: Add port scan
+  # TODO: Add content discovery - disable by default, enable by flag to dodge WAF's
+
+  echo ""
+	echo "Scan for $domain finished successfully"
+  echo ""
 }
-vaild_urls
 
-#.........gf patters..........
 
-gf_patterns(){
-
-	for domain in $(cat $host);
-do
-
-gf xss $domain/Recon/wayback/vaild.txt | tee $domain/Recon/gf/xss.txt 
-gf ssrf $domain/Recon/wayback/vaild.txt | tee $domain/Recon/gf/ssrf.txt
-gf sqli $domain/Recon/wayback/vaild.txt | tee $domain/Recon/gf/sqli.txt
-
-done
-}
-gf_patterns
-
-#........Custom wordlist for enum!!...
-
-custom_wordlist(){
-
-for domain in $(cat $host);
-do
-cat $domain/Recon/wayback/wayback.txt | unfurl -unique paths > $domain/Recon/wordlist/path.txt
-cat $domain/Recon/wayback/wayback.txt | unfurl -unique keys > $domain/Recon/wordlist/keys.txt
-
-done
-}
-custom_wordlist
-
-#........Resolve Domain to Ip for masscan & nmap scan....
-
-get_ip(){
-
-for domain in $(cat $host);
-do
-$resolve domain $domain/Recon/masscan/results.txt $domain/domains.txt
-gf ip $domain/Recon/masscan/results.txt | sort -u > $domain/Recon/masscan/ip.txt
-
-done
-}
-get_ip
+today=$(date +"%Y-%m-%d-%H-%M")
+startTime=$(date +"%Y-%m-%d %H:%M:%S")
+path=$(pwd)
+reportBase="$path/recon_out/$domain"
+reportPath="$path/recon_out/$domain/$today/"
+main $domain
+finishTime=$(date +"%Y-%m-%d %H:%M:%S")
+echo "Start Time:  $startTime"
+echo "Finish Time: $finishTime"
 
